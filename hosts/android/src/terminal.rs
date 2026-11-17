@@ -505,9 +505,19 @@ impl TerminalHost for AndroidTerminalHost {
             value => value.to_string(),
         };
         let key = sessionKey(&normalizedTerminalType, &normalizedExecutorKey);
-        let sessionId =
-            hiddenAndroidPtySessionId(self, &key, &normalizedExecutorKey, &normalizedTerminalType)?;
-        let output = self.executeInSession(&sessionId, &normalizedCommand, timeoutMs)?;
+        // Every hidden command runs in its own short-lived session. Reusing one
+        // shared shell across concurrent calls let a single hung command block
+        // every later caller, which is exactly the global stall we are removing.
+        let sessionId = hiddenAndroidPtySessionId(
+            self,
+            &format!("{key}:{}", nextTerminalId()),
+            &normalizedExecutorKey,
+            &normalizedTerminalType,
+        )?;
+        let output = self.executeInSession(&sessionId, &normalizedCommand, timeoutMs);
+        // The throwaway session is reclaimed as soon as the command settles.
+        let _ = self.closeSession(&sessionId);
+        let output = output?;
         Ok(HiddenTerminalCommandOutput {
             command: normalizedCommand,
             output: output.output,
@@ -1966,6 +1976,10 @@ fn terminateAndroidPtyProcess(process: AndroidPtyProcess) {
                 if libc::waitpid(pid, &mut status, libc::WNOHANG) != 0 {
                     return;
                 }
+                // Each session owns a dedicated process group, so signal the whole
+                // group and let the kernel reclaim orphaned grandchildren too.
+                libc::killpg(pid, libc::SIGHUP);
+                libc::killpg(pid, libc::SIGKILL);
                 libc::kill(pid, libc::SIGHUP);
                 libc::kill(pid, libc::SIGKILL);
                 while libc::waitpid(pid, &mut status, 0) < 0
@@ -2083,6 +2097,9 @@ fn forkPtyExecve(
         }
         if pid == 0 {
             unsafe {
+                // Isolate every PTY session into its own process group so a hung
+                // command tree can be reclaimed without touching sibling sessions.
+                libc::setsid();
                 if command.dropRootToShell && libc::geteuid() == 0 {
                     dropRootToShellIdentity();
                 }
