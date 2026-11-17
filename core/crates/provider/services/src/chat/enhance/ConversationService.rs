@@ -174,7 +174,11 @@ impl ConversationService {
                 ..before_context
             })
             .await?;
-        Ok(after_context.prepared_history)
+        // Keep the request window inside a workable budget instead of carrying
+        // the full transcript until the provider rejects it and the turn stalls.
+        Ok(crate::chat::enhance::ContextBudget::trim_prompt_history(
+            after_context.prepared_history,
+        ))
     }
 
     /// Converts stored locators only in the provider-facing copy of conversation history.

@@ -1,3 +1,5 @@
+#[path = "ContextBudget.rs"]
+pub mod ContextBudget;
 #[path = "ConversationRoundManager.rs"]
 pub mod ConversationRoundManager;
 #[path = "ConversationService.rs"]
