@@ -18,8 +18,8 @@ use super::StreamingResponseLines::SseDecoder;
 use super::StructuredToolCallBridge::StructuredToolCallBridge;
 use super::ThinkingDialect::{apply_thinking, ThinkingDialect};
 use crate::chat::llmprovider::AIService::{
-    response_stream_from_chunks, retry_error_text, retry_message, AIService, AiServiceError,
-    SendMessageRequest, SharedAiResponseStream, TokenCounts,
+    is_retryable_ai_error, response_stream_from_chunks, retry_error_text, retry_message,
+    AIService, AiServiceError, SendMessageRequest, SharedAiResponseStream, TokenCounts,
 };
 use crate::chat::llmprovider::LlmRetryPolicy::delay_retry_ms;
 use crate::chat::llmprovider::MediaLinkParser::{MediaLink, MediaLinkParser};
@@ -1373,6 +1373,20 @@ impl OpenAIProvider {
                     "response stream ended before completion".to_string(),
                 ));
             }
+            // A thinking model whose answer never reached the content channel
+            // must not pass as a normal success: the user would only see a
+            // thinking log with no actual reply (commonly because the provider
+            // safety system cut the stream mid-thinking).
+            if !state.hasEmittedRegularContent
+                && state.regularContentBytes == 0
+                && state.nativeToolCallDeltaCount == 0
+                && state.accumulatedToolCalls.is_empty()
+                && state.reasoningObserved
+            {
+                return Err(AiServiceError::RequestFailed(
+                    "模型只输出了思考内容，未生成正文（可能被服务商安全策略截断）".to_string(),
+                ));
+            }
 
             self.set_estimated_output_tokens(&emitter.received_content);
             self.apply_token_counts(state.usage.clone());
@@ -2643,6 +2657,7 @@ impl OpenAIProvider {
                                     if !enable_retry
                                         || retryCount
                                             > super::LlmRetryPolicy::LlmRetryPolicy::MAX_RETRY_ATTEMPTS
+                                        || !is_retryable_ai_error(&error)
                                     {
                                         break Err(error);
                                     }
@@ -2740,7 +2755,7 @@ impl OpenAIProvider {
                     }
                     Err(error) => {
                         let errorText = retry_error_text(&error);
-                        if !enable_retry {
+                        if !enable_retry || !is_retryable_ai_error(&error) {
                             return Err(error);
                         }
                         let newRetryCount = retryCount + 1;
@@ -2761,7 +2776,7 @@ impl OpenAIProvider {
                     let message = self.readResponseText(response).await?;
                     let error = AiServiceError::RequestFailed(format!("{status}: {message}"));
                     let errorText = retry_error_text(&error);
-                    if !enable_retry {
+                    if !enable_retry || !is_retryable_ai_error(&error) {
                         return Err(error);
                     }
                     let newRetryCount = retryCount + 1;
@@ -2789,18 +2804,29 @@ impl OpenAIProvider {
                 output: 0,
             });
         let mut chunks = Vec::new();
+        let mut hasRegularContent = false;
+        let mut hasReasoningContent = false;
         let nativeToolCallChunks = extract_tool_calls_xml_chunks(&json_response);
         if let Some(reasoning) = extract_reasoning_chunk(&json_response) {
             if !reasoning.is_empty() {
+                hasReasoningContent = true;
                 chunks.push(format!("<think>{reasoning}</think>"));
             }
         }
         if let Some(content) = extract_content_chunk(&json_response) {
             if !content.is_empty() {
+                hasRegularContent = true;
                 chunks.push(content);
             }
         }
         chunks.extend(nativeToolCallChunks);
+        // Same rule as the streaming path: a thinking-only answer is a
+        // failure, not a silent success (see read_streaming_response).
+        if !hasRegularContent && nativeToolCallChunks.is_empty() && hasReasoningContent {
+            return Err(AiServiceError::RequestFailed(
+                "模型只输出了思考内容，未生成正文（可能被服务商安全策略截断）".to_string(),
+            ));
+        }
         self.set_estimated_output_tokens(&chunks.concat());
         self.apply_token_counts(token_counts);
         Ok(chunks)

@@ -12,8 +12,8 @@ use super::StreamingResponseLines::SseDecoder;
 use super::StructuredToolCallBridge::{OpenToolCall, StructuredToolCallBridge};
 use super::ThinkingDialect::ThinkingDialect;
 use crate::chat::llmprovider::AIService::{
-    response_stream_from_chunks, retry_error_text, retry_message, AIService, AiServiceError,
-    SendMessageRequest, SharedAiResponseStream, TokenCounts,
+    is_retryable_ai_error, response_stream_from_chunks, retry_error_text, retry_message,
+    AIService, AiServiceError, SendMessageRequest, SharedAiResponseStream, TokenCounts,
 };
 use crate::chat::llmprovider::LlmRetryPolicy::delay_retry_ms;
 use crate::chat::llmprovider::MediaLinkParser::MediaLinkParser;
@@ -880,6 +880,7 @@ impl ClaudeProvider {
                 Err(error) => {
                     if !request.enable_retry
                         || retry_count >= super::LlmRetryPolicy::LlmRetryPolicy::MAX_RETRY_ATTEMPTS
+                        || !is_retryable_ai_error(&error)
                     {
                         return Err(error);
                     }
@@ -920,7 +921,7 @@ impl ClaudeProvider {
                 }
                 Err(error) => {
                     let errorText = retry_error_text(&error);
-                    if !request.enable_retry {
+                    if !request.enable_retry || !is_retryable_ai_error(&error) {
                         return Err(error);
                     }
                     let newRetryCount = retryCount + 1;
@@ -940,7 +941,7 @@ impl ClaudeProvider {
                 let text = self.readResponseText(response).await?;
                 let error = AiServiceError::RequestFailed(format!("{status}: {text}"));
                 let errorText = retry_error_text(&error);
-                if !request.enable_retry {
+                if !request.enable_retry || !is_retryable_ai_error(&error) {
                     return Err(error);
                 }
                 let newRetryCount = retryCount + 1;

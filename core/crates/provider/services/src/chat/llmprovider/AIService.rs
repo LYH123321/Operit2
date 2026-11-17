@@ -120,6 +120,44 @@ pub fn retry_message(error_text: &str, retry_number: i32) -> String {
     format!("{error_text}，正在进行第 {retry_number} 次重试...")
 }
 
+/// Returns whether a failed model request is worth retrying unchanged.
+///
+/// Provider content-moderation rejections and other deterministic 4xx
+/// responses reproduce identically on every retry: each attempt re-runs
+/// the model (including its thinking) only to hit the same safety wall,
+/// so they must fail fast instead of burning MAX_RETRY_ATTEMPTS rounds.
+pub fn is_retryable_ai_error(error: &AiServiceError) -> bool {
+    let message = retry_error_text(error).to_lowercase();
+    const MODERATION_MARKERS: [&str; 14] = [
+        "content exists risk",
+        "content_filter",
+        "content filter",
+        "content policy",
+        "content moderation",
+        "moderation",
+        "safety system",
+        "sensitive",
+        "内容安全",
+        "内容存在风险",
+        "敏感",
+        "审核",
+        "违规",
+        "未生成正文",
+    ];
+    if MODERATION_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        return false;
+    }
+    const DETERMINISTIC_STATUSES: [&str; 8] =
+        ["400", "401", "403", "404", "405", "410", "422", "451"];
+    DETERMINISTIC_STATUSES
+        .iter()
+        .any(|status| message.starts_with(status))
+}
+
+
 /// Common async interface implemented by every model provider.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
