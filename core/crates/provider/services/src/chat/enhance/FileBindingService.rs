@@ -235,23 +235,38 @@ impl FileBindingService {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let mut enrichedOps = Vec::<(EditOperation, usize, usize)>::new();
+        // Operations that cannot be anchored are collected instead of aborting
+        // the whole batch. A single stale block must not discard every other
+        // edit the model already produced.
+        let mut rejectedOps = Vec::<String>::new();
 
         for op in operations {
             let (start, end) = self.findBestMatchRange(&originalLines, &op.oldContent);
             if start < 0 {
-                return (
-                    false,
-                    "Could not find a match for an OLD block. The file may have changed too much."
-                        .to_string(),
-                );
+                rejectedOps.push(format!(
+                    "Could not find a match for an OLD block: {}",
+                    firstLinePreview(&op.oldContent)
+                ));
+                continue;
             }
             if self.hasMultiplePerfectMatches(originalContent, &op.oldContent) {
-                return (
-                    false,
-                    "Found multiple perfect matches for an OLD block in the target file. Please refine the patch so it only matches a single location.".to_string(),
-                );
+                rejectedOps.push(format!(
+                    "Found multiple perfect matches for an OLD block, refine the patch: {}",
+                    firstLinePreview(&op.oldContent)
+                ));
+                continue;
             }
             enrichedOps.push((op.clone(), start as usize, end as usize));
+        }
+
+        if enrichedOps.is_empty() {
+            return (
+                false,
+                format!(
+                    "Could not apply patch. Reason: {}",
+                    rejectedOps.join("; ")
+                ),
+            );
         }
 
         enrichedOps.sort_by(|left, right| right.1.cmp(&left.1));
@@ -278,7 +293,15 @@ impl FileBindingService {
             }
         }
 
-        (true, originalLines.join("\n"))
+        let mut result = originalLines.join("\n");
+        if !rejectedOps.is_empty() {
+            result = format!(
+                "{result}\n\n[... partially applied: {} edit(s) were skipped: {}]",
+                rejectedOps.len(),
+                rejectedOps.join("; ")
+            );
+        }
+        (true, result)
     }
 
     fn tryApplyBoundaryPreservingEdit(
@@ -772,6 +795,18 @@ pub fn compute_intra_line_spans(
     ))
 }
 
+/// Builds a short single-line preview of an edit anchor for reporting.
+fn firstLinePreview(content: &str) -> String {
+    let firstLine = content.lines().find(|line| !line.trim().is_empty()).unwrap_or("");
+    let trimmed = firstLine.trim();
+    let clipped: String = trimmed.chars().take(60).collect();
+    if trimmed.chars().count() > 60 {
+        format!("{clipped}...")
+    } else {
+        clipped
+    }
+}
+
 #[cfg(test)]
 mod bounded_diff_tests {
     use super::*;
@@ -818,5 +853,46 @@ mod bounded_diff_tests {
                 assert_eq!(after, modified);
             }
         }
+    }
+    /// A batch edit keeps the operations that matched even when one anchor is stale.
+    #[test]
+    fn batch_edit_keeps_successful_operations_when_one_anchor_is_missing() {
+        let service = FileBindingService;
+        let original = "alpha\nbravo\ncharlie\n";
+        let operations = vec![
+            StructuredEditOperation {
+                action: StructuredEditAction::REPLACE,
+                oldContent: "bravo".to_string(),
+                newContent: "BRAVO".to_string(),
+            },
+            StructuredEditOperation {
+                action: StructuredEditAction::REPLACE,
+                oldContent: "this anchor does not exist".to_string(),
+                newContent: "replacement".to_string(),
+            },
+        ];
+        let (result, diff) = service.processFileBindingOperations(original, &operations);
+        assert!(result.contains("BRAVO"), "the matching edit must survive");
+        assert!(result.contains("charlie"), "untouched content must survive");
+        assert!(
+            result.contains("partially applied"),
+            "the skipped operation must be reported: {result}"
+        );
+        assert!(!diff.is_empty());
+    }
+
+    /// A batch edit fails only when no operation can be anchored at all.
+    #[test]
+    fn batch_edit_fails_when_no_operation_can_be_anchored() {
+        let service = FileBindingService;
+        let original = "alpha\nbravo\n";
+        let operations = vec![StructuredEditOperation {
+            action: StructuredEditAction::REPLACE,
+            oldContent: "completely unrelated anchor".to_string(),
+            newContent: "replacement".to_string(),
+        }];
+        let (result, diff) = service.processFileBindingOperations(original, &operations);
+        assert_eq!(result, original);
+        assert!(diff.starts_with("Error: Could not apply patch"));
     }
 }
