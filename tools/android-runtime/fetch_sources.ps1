@@ -41,7 +41,25 @@ $items = @(
 foreach ($item in $items) {
     $archivePath = Join-Path $downloadsDir $item.Archive
     Write-Host "Downloading $($item.Name)"
-    Invoke-WebRequest -Uri $item.Url -OutFile $archivePath
+    # Upstream mirrors (e.g. samba.org) occasionally answer 503; retry a
+    # few times with backoff before failing the whole workflow. Archives
+    # are SHA256-verified below, so a retry can never corrupt inputs.
+    $downloaded = $false
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $item.Url -OutFile $archivePath -ErrorAction Stop
+            $downloaded = $true
+            break
+        } catch {
+            Write-Host "Download attempt $attempt failed: $($_.Exception.Message)"
+            if ($attempt -lt 5) {
+                Start-Sleep -Seconds (10 * $attempt)
+            }
+        }
+    }
+    if (-not $downloaded) {
+        throw "$($item.Name) download failed after 5 attempts"
+    }
 
     $actualSha256 = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToUpperInvariant()
     if ($actualSha256 -ne $item.Sha256) {
