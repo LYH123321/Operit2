@@ -208,7 +208,7 @@ impl GeminiProvider {
         if self.is_cancelled() {
             return Err(AiServiceError::RequestCancelled);
         }
-        let delayMs = super::LlmRetryPolicy::LlmRetryPolicy::nextDelayMs(retryAttempt);
+        let delayMs = super::LlmRetryPolicy::LlmRetryPolicy::nextDelayMsWithJitter(retryAttempt);
         tokio::select! {
             _ = defaultHostRuntimeTaskSchedulerHost().waitForHostRuntimeDelay(delayMs as u64) => Ok(()),
             _ = self.clone().waitUntilCancelled() => Err(AiServiceError::RequestCancelled),

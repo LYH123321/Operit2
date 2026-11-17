@@ -782,7 +782,7 @@ impl OpenAIProvider {
         if self.is_cancelled() {
             return Err(AiServiceError::RequestCancelled);
         }
-        let delayMs = super::LlmRetryPolicy::LlmRetryPolicy::nextDelayMs(retryAttempt);
+        let delayMs = super::LlmRetryPolicy::LlmRetryPolicy::nextDelayMsWithJitter(retryAttempt);
         tokio::select! {
             _ = defaultHostRuntimeTaskSchedulerHost().waitForHostRuntimeDelay(delayMs as u64) => Ok(()),
             _ = Self::waitForCancellation(receiver, observedGeneration) => Err(AiServiceError::RequestCancelled),
@@ -2646,7 +2646,19 @@ impl OpenAIProvider {
                                     {
                                         break Err(error);
                                     }
-                                    let _ = emitter.emit_rollback(&request_savepoint_id);
+                                    // A dropped connection used to discard everything that
+                                    // already arrived and restart the whole answer. When
+                                    // the provider already produced content we keep it and
+                                    // let the retry continue, so a flaky link costs a
+                                    // short pause instead of the entire response.
+                                    let receivedBeforeFailure = emitter.received_content.len();
+                                    let keepPartialContent = matches!(
+                                        error,
+                                        AiServiceError::ConnectionFailed(_)
+                                    ) && receivedBeforeFailure > 0;
+                                    if !keepPartialContent {
+                                        let _ = emitter.emit_rollback(&request_savepoint_id);
+                                    }
                                     if let Some(callback) = on_non_fatal_error.as_ref() {
                                         callback(retry_message(&retry_error_text(&error), retryCount));
                                     }
