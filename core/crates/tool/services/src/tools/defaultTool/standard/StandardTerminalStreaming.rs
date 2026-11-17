@@ -54,7 +54,9 @@ struct Arguments {
 
 pub(crate) struct TerminalStreamExecutor {
     tools: StandardTerminalTools,
-    managedAdmission: tokio::sync::Mutex<()>,
+    /// Admission is scoped per session name so an unrelated hung command can
+    /// never stall terminal work that targets a different session.
+    managedAdmission: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     host: Option<Arc<dyn TerminalHost>>,
     scheduler: Option<Arc<dyn HostRuntimeTaskSchedulerHost>>,
     observations: Mutex<HashMap<String, Arc<Observation>>>,
@@ -136,7 +138,7 @@ impl TerminalStreamExecutor {
         Self {
             host: tools.terminalHost.clone(),
             tools,
-            managedAdmission: tokio::sync::Mutex::new(()),
+            managedAdmission: std::sync::Mutex::new(std::collections::HashMap::new()),
             scheduler,
             observations: Mutex::new(HashMap::new()),
             workers: Arc::new(AtomicUsize::new(0)),
@@ -373,6 +375,21 @@ impl TerminalStreamExecutor {
             .await
     }
 
+    /// Returns the admission gate dedicated to one session name.
+    ///
+    /// Commands targeting different session names never wait on each other, so a
+    /// single hung command cannot freeze the whole terminal surface.
+    fn admissionFor(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut registry = self
+            .managedAdmission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Reserves pending and running commands before releasing admission to the next caller.
     async fn startNamed(
         &self,
@@ -383,7 +400,8 @@ impl TerminalStreamExecutor {
         waitMs: u64,
         receiptOnly: bool,
     ) -> Result<String, String> {
-        let _admission = self.managedAdmission.lock().await;
+        let admission = self.admissionFor(&name);
+        let _admission = admission.lock().await;
         let tools = &self.tools;
         let mut reserved = std::collections::BTreeSet::new();
         for value in self
